@@ -1,0 +1,7 @@
+src/
+keys/
+out/
+*.apk
+*.aligned.apk
+.gradle/
+build/

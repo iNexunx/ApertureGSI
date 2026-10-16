@@ -1,0 +1,201 @@
+name: Build Aperture (Android 12 / 12L / 13 / 14 / 15)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Android 12 (API 31)
+          - name: android12
+            min_sdk: "31"
+            target_sdk: "31"
+            version_name: "12"
+            version_code: "12"
+            upstream_ref: "lineage-20.0"
+            platform: "33"
+            build_tools: "33.0.0"
+          # Android 12L (API 32)
+          - name: android12L
+            min_sdk: "32"
+            target_sdk: "32"
+            version_name: "12.1"
+            version_code: "121"
+            upstream_ref: "lineage-20.0"
+            platform: "33"
+            build_tools: "33.0.0"
+          # Android 13 (API 33)
+          - name: android13
+            min_sdk: "33"
+            target_sdk: "33"
+            version_name: "13"
+            version_code: "13"
+            upstream_ref: "lineage-20.0"
+            platform: "33"
+            build_tools: "33.0.0"
+          # Android 14 (API 34)
+          - name: android14
+            min_sdk: "34"
+            target_sdk: "34"
+            version_name: "14"
+            version_code: "14"
+            upstream_ref: "lineage-21.0"
+            platform: "34"
+            build_tools: "34.0.0"
+          # Android 15 (API 35)
+          - name: android15
+            min_sdk: "35"
+            target_sdk: "35"
+            version_name: "15"
+            version_code: "15"
+            upstream_ref: "lineage-22.2"
+            platform: "35"
+            build_tools: "35.0.0"
+    env:
+      UPSTREAM_REF: ${{ matrix.upstream_ref }}
+      OVERLAY_REF: "lineage-22.2"
+      MIN_SDK: ${{ matrix.min_sdk }}
+      TARGET_SDK: ${{ matrix.target_sdk }}
+      VERSION_NAME: ${{ matrix.version_name }}
+      VERSION_CODE: ${{ matrix.version_code }}
+      SIGNING_KEY: platform
+    steps:
+      - name: Checkout repo de build
+        uses: actions/checkout@v4
+
+      - name: Checkout fuente Aperture (LineageOS)
+        uses: actions/checkout@v4
+        with:
+          repository: LineageOS/android_packages_apps_Aperture
+          ref: ${{ matrix.upstream_ref }}
+          path: src
+          fetch-depth: 1
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-${{ matrix.platform }} platforms;android-36 build-tools;${{ matrix.build_tools }}'
+
+      - name: Ajustar SDK y version (minSdk / targetSdk / versionName / versionCode)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          sed -i -E "s/minSdk = [0-9]+/minSdk = ${MIN_SDK}/" app/build.gradle.kts lens_launcher/build.gradle.kts
+          sed -i -E "s/targetSdk = [0-9]+/targetSdk = ${TARGET_SDK}/" app/build.gradle.kts lens_launcher/build.gradle.kts
+          sed -i -E "s/versionCode = [0-9]+/versionCode = ${VERSION_CODE}/" app/build.gradle.kts lens_launcher/build.gradle.kts
+          sed -i -E "s/versionName = \"[^\"]*\"/versionName = \"${VERSION_NAME}\"/" app/build.gradle.kts lens_launcher/build.gradle.kts
+          echo "::group::Config final (${{ matrix.name }})"
+          grep -nE "compileSdk|minSdk|targetSdk|versionCode|versionName" app/build.gradle.kts lens_launcher/build.gradle.kts
+          echo "::endgroup::"
+
+      - name: Compilar release
+        working-directory: src
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          # -x lintVitalRelease: evita el abort por ExpiredTargetSdkVersion
+          # (Google Play exige targetSdk alto; nosotros fijamos uno a proposito).
+          ./gradlew --no-daemon --stacktrace \
+            :app:assembleRelease :lens_launcher:assembleRelease \
+            -x lintVitalRelease
+
+      - name: Compilar overlay (RRO) y preparar sysconfig
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          BT="$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)"
+          JAR="$SDK/platforms/android-36/android.jar"
+          BASE="https://raw.githubusercontent.com/LineageOS/android_packages_apps_Aperture/${OVERLAY_REF}"
+          OV="overlay"
+          UO="${RUNNER_TEMP:-/tmp}/ApertureFrameworksBaseOverlay.unsigned.apk"
+          echo "Build-tools: $BT"
+          mkdir -p out "$OV/res/values"
+          # El overlay y los sysconfig no existen en lineage-20.0; se toman de OVERLAY_REF
+          # (el contenido del RRO es identico en todas las ramas).
+          curl -fsSL -o "$OV/AndroidManifest.xml" "$BASE/rro_overlays/ApertureFrameworksBaseOverlay/AndroidManifest.xml"
+          curl -fsSL -o "$OV/res/values/config.xml" "$BASE/rro_overlays/ApertureFrameworksBaseOverlay/res/values/config.xml"
+          curl -fsSL -o "out/initial-package-stopped-states-org.lineageos.aperture.xml" "$BASE/app/initial-package-stopped-states-org.lineageos.aperture.xml"
+          curl -fsSL -o "out/preinstalled-packages-org.lineageos.aperture.xml" "$BASE/app/preinstalled-packages-org.lineageos.aperture.xml"
+          # version consistente con las apps
+          sed -i -E "s/android:versionCode=\"[0-9]+\"/android:versionCode=\"${VERSION_CODE}\"/" "$OV/AndroidManifest.xml"
+          sed -i -E "s/android:versionName=\"[^\"]*\"/android:versionName=\"${VERSION_NAME}\"/" "$OV/AndroidManifest.xml"
+          echo "::group::Manifest overlay (${{ matrix.name }})"
+          cat "$OV/AndroidManifest.xml"
+          echo "::endgroup::"
+          "$BT/aapt2" compile --dir "$OV/res" -o "${RUNNER_TEMP:-/tmp}/overlay_res.zip"
+          "$BT/aapt2" link \
+            -o "$UO" \
+            -I "$JAR" \
+            --manifest "$OV/AndroidManifest.xml" \
+            --min-sdk-version "${MIN_SDK}" \
+            --target-sdk-version "${TARGET_SDK}" \
+            "${RUNNER_TEMP:-/tmp}/overlay_res.zip"
+
+      - name: Descargar test-keys de AOSP
+        run: |
+          set -euo pipefail
+          mkdir -p keys
+          BASE="https://raw.githubusercontent.com/LineageOS/android_build/lineage-22.2/target/product/security"
+          curl -fsSL -o keys/key.pk8 "$BASE/${SIGNING_KEY}.pk8"
+          curl -fsSL -o keys/key.x509.pem "$BASE/${SIGNING_KEY}.x509.pem"
+          echo "Test-key usada: ${SIGNING_KEY}"
+
+      - name: Zipalign + firma (apksigner)
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          BT="$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)"
+          echo "Build-tools: $BT"
+          mkdir -p out
+          sign_apk () {
+            local unsigned="$1" name="$2"
+            "$BT/zipalign" -f -p 4 "$unsigned" "out/${name}.aligned.apk"
+            "$BT/apksigner" sign \
+              --key keys/key.pk8 \
+              --cert keys/key.x509.pem \
+              --v4-signing-enabled false \
+              --out "out/${name}.apk" \
+              "out/${name}.aligned.apk"
+            rm -f "out/${name}.aligned.apk"
+            "$BT/apksigner" verify --verbose --print-certs "out/${name}.apk"
+          }
+          sign_apk src/app/build/outputs/apk/release/app-release-unsigned.apk Aperture
+          sign_apk src/lens_launcher/build/outputs/apk/release/lens_launcher-release-unsigned.apk ApertureLensLauncher
+          sign_apk "${RUNNER_TEMP:-/tmp}/ApertureFrameworksBaseOverlay.unsigned.apk" ApertureFrameworksBaseOverlay
+          echo "::group::Salida (${{ matrix.name }})"
+          ls -l out
+          echo "::endgroup::"
+
+      - name: Subir artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aperture-${{ matrix.name }}-v${{ matrix.version_name }}-full
+          path: out/*
+          if-no-files-found: error
+
+      - name: Publicar release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ matrix.name }}-build-${{ github.run_number }}
+          name: "Aperture ${{ matrix.name }} (API ${{ matrix.target_sdk }}) v${{ matrix.version_name }} - build ${{ github.run_number }}"
+          files: out/*
+          generate_release_notes: true
